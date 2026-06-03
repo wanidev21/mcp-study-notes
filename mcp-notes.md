@@ -225,7 +225,113 @@ claude mcp list
 
 ---
 
-## 4. 핵심 요약
+
+---
+
+## 4. 직접 만든 서버를 통해 본 MCP의 본질
+
+### 공식 GitHub MCP 서버와의 차이
+
+| | 우리가 만든 서버 | 공식 GitHub MCP 서버 |
+|---|---|---|
+| 도구 수 | 3개 (add, reverse_text, upload_to_github) | 수십 개 (PR, 이슈, 브랜치, 검색...) |
+| 목적 | MCP 구조 학습 | 실무 GitHub 자동화 |
+| 구현 | Python 50줄 | Go 바이너리 |
+| 유지보수 | 직접 | GitHub이 관리 |
+| **MCP 구조** | **동일** | **동일** |
+
+**둘의 차이는 "기능의 범위"뿐이다. MCP 관점에서 구조는 완전히 같다.**
+양쪽 모두 "GitHub API를 MCP 형식으로 감싼 변환기"이며, 왼쪽 다리(MCP 규격)와 오른쪽 다리(GitHub API)의 구조가 동일하다.
+
+---
+
+### 우리 서버의 코드 한 줄 → MCP 본질
+
+**① `@mcp.tool()` → Tool Primitive 선언**
+
+함수 하나 = Tool 하나. 이 데코레이터가 MCP의 Tool Primitive를 만드는 행위다.
+FastMCP가 함수를 AI가 호출할 수 있는 표준 형식(Tool Schema)으로 자동 변환한다.
+
+**② Docstring → AI의 도구 선택 기준**
+
+MCP에서 Tool의 `description` 필드다.
+AI는 사용자 요청과 이 설명을 매칭해서 어떤 도구를 쓸지 결정한다.
+AI는 구현 코드(httpx, base64 등)를 볼 수 없고 오직 이 설명만 본다.
+→ **docstring을 잘 써야 AI가 도구를 제대로 쓴다.**
+
+**③ Type hints → Tool의 inputSchema**
+
+AI가 도구를 부를 때 "어떤 인자를 어떤 타입으로 넣어야 하는지"를 알려주는 schema다.
+AI가 실제 값(파일명, 내용, 커밋 메시지)을 채워 넣는 기준이 된다.
+FastMCP가 타입힌트를 읽어서 JSON Schema로 자동 변환한다.
+
+예: `upload_to_github(path: str, content: str, message: str = "Update via MCP")`
+→ AI는 "path는 문자열, content는 문자열, message는 선택사항"임을 이 정보만으로 안다.
+
+**④ `return "성공: url"` → ToolResult**
+
+함수의 반환값이 곧 MCP의 ToolResult다.
+이 값이 JSON-RPC로 포장되어 Client → AI로 돌아오고,
+AI가 사용자에게 최종 답변을 만드는 재료로 쓴다.
+
+**⑤ `mcp.run()` → Transport 선언**
+
+stdio transport로 서버를 실행한다는 선언.
+Claude Code가 이 프로세스를 직접 띄우고 stdin/stdout으로 JSON-RPC 메시지를 주고받는다.
+`transport="streamable-http"`로 바꾸면 원격 HTTP 서버가 된다.
+
+**⑥ Client ↔ 서버 구간 → 왼쪽 다리 (표준화된 구간)**
+
+JSON-RPC 2.0 형식. 어떤 서버든 항상 같은 형식으로 요청하고 결과를 받는다.
+
+```json
+{ "method": "tools/call", "params": { "name": "upload_to_github", "arguments": { "path": "mcp-notes.md", "content": "..." } } }
+```
+
+이 구간이 표준화되어 있기 때문에 어떤 AI 호스트든 어떤 MCP 서버든 별도 작업 없이 연결된다.
+→ **M×N을 M+N으로 줄이는 핵심.**
+
+**⑦ `httpx.get / httpx.put` → 오른쪽 다리 (서비스별 비표준)**
+
+각 서비스의 원래 API를 그대로 사용한다.
+GitHub이면 REST API + base64 인코딩 + sha,
+Slack이면 Slack API, DB면 SQL.
+이 구간이 서비스마다 달라서 MCP 서버(변환기)가 존재하는 이유다.
+→ **오른쪽 다리의 다양성을 왼쪽의 표준으로 흡수하는 것이 서버의 역할.**
+
+**⑧ `os.environ.get("GITHUB_TOKEN")` → MCP의 보안 패턴**
+
+토큰을 코드에 직접 넣지 않고 Host가 환경변수로 주입한다.
+`claude mcp add-json`의 `env` 필드 → `~/.claude.json`에 저장 → 서버 실행 시 주입.
+코드를 GitHub에 올려도 토큰이 노출되지 않는 이유다.
+
+**⑨ Discovery (tools/list) → 자동 도구 등록**
+
+`@mcp.tool()`로 선언한 함수들이 연결 즉시 Host에 자동으로 노출된다.
+Claude Code가 연결 시 "너 뭐 할 수 있어?"라고 물어보고 목록을 받아온다.
+새 도구를 추가하면 재등록 없이 서버 재시작만 해도 AI가 새 도구를 인식한다.
+
+---
+
+### 결론
+
+공식 GitHub MCP 서버는 우리가 만든 것과 구조가 완전히 같다.
+차이는 오른쪽 다리에서 GitHub API를 얼마나 많이 활용하느냐뿐이다.
+
+```
+MCP의 본질 = 왼쪽 다리를 표준화해서 M×N → M+N으로 줄이는 것
+
+우리 서버 50줄도 이 본질을 완전히 구현하고 있다.
+공식 서버는 오른쪽 다리(GitHub API 활용)를 더 많이 구현했을 뿐이다.
+```
+
+직접 만들어봤기 때문에 공식 서버 코드를 봐도 구조가 보이고,
+work2 같은 자체 서비스를 MCP 서버로 만들 때도 같은 패턴을 그대로 쓸 수 있다.
+
+
+---
+
+## 5. 핵심 요약
 
 ```
 MCP 서버 = 기존 API를 MCP 형식으로 감싼 변환 프로그램
